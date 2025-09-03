@@ -8,6 +8,9 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+	"crypto/md5"
+	"strconv"
+	"encoding/hex"
 
 	"github.com/rstutsman/cs6450-labs/kvs"
 )
@@ -52,7 +55,7 @@ func (client *Client) Put(key string, value string) {
 
 func runClient(id int, addr string, done *atomic.Bool, workload *kvs.Workload, resultsCh chan<- uint64) {
 	client := Dial(addr)
-
+	fmt.Println("key %s" ,getKeyHash(10))
 	value := strings.Repeat("x", 128)
 	const batchSize = 1024
 
@@ -87,6 +90,14 @@ func (h *HostList) Set(value string) error {
 	return nil
 }
 
+func getKeyHash(key int) string{
+
+	strKey := strconv.Itoa(key)
+	fmt.Printf("using key %s", strKey)
+	hashedKey := md5.Sum([]byte(strKey))
+	return hex.EncodeToString(hashedKey[:])
+}
+
 func main() {
 	hosts := HostList{}
 
@@ -99,7 +110,7 @@ func main() {
 	if len(hosts) == 0 {
 		hosts = append(hosts, "localhost:8080")
 	}
-
+	
 	fmt.Printf(
 		"hosts %v\n"+
 			"theta %.2f\n"+
@@ -113,12 +124,18 @@ func main() {
 	done := atomic.Bool{}
 	resultsCh := make(chan uint64)
 
-	host := hosts[0]
-	clientId := 0
-	go func(clientId int) {
-		workload := kvs.NewWorkload(*workload, *theta)
-		runClient(clientId, host, &done, workload, resultsCh)
-	}(clientId)
+	
+	// host := hosts[0]
+	// clientId := 0
+
+	for idx, host := range hosts{
+		fmt.Printf("Running on host: %s, clientId: %d", host , idx)
+		clientId := idx
+		go func(clientId int) {
+			workload := kvs.NewWorkload(*workload, *theta)
+			runClient(clientId, host, &done, workload, resultsCh)
+		}(clientId)
+	}
 
 	time.Sleep(time.Duration(*secs) * time.Second)
 	done.Store(true)

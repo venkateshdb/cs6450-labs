@@ -1,9 +1,12 @@
 package main
 
 import (
+	"crypto/md5"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"log"
+	"math/big"
 	"net/rpc"
 	"strings"
 	"sync/atomic"
@@ -43,6 +46,7 @@ func (client *Client) Put(key string, value string) {
 		Key:   key,
 		Value: value,
 	}
+
 	response := kvs.PutResponse{}
 	err := client.rpcClient.Call("KVService.Put", &request, &response)
 	if err != nil {
@@ -50,8 +54,16 @@ func (client *Client) Put(key string, value string) {
 	}
 }
 
-func runClient(id int, addr string, done *atomic.Bool, workload *kvs.Workload, resultsCh chan<- uint64) {
-	client := Dial(addr)
+func runClient(id int, addr string, done *atomic.Bool, workload *kvs.Workload, resultsCh chan<- uint64, servers []string) {
+	N := len(servers)
+
+	clients := []*Client{}
+
+	for _, host := range servers {
+		clients = append(clients, Dial(host))
+	}
+	fmt.Println("Clients", clients)
+	// client := Dial(addr)
 
 	value := strings.Repeat("x", 128)
 	const batchSize = 1024
@@ -62,10 +74,13 @@ func runClient(id int, addr string, done *atomic.Bool, workload *kvs.Workload, r
 		for j := 0; j < batchSize; j++ {
 			op := workload.Next()
 			key := fmt.Sprintf("%d", op.Key)
+			// fmt.Printf("Sending: key %s\n", key)
+			client_idx := getServerIdx(key, N)
+			// fmt.Printf("client ID: %d\n", client_idx)
 			if op.IsRead {
-				client.Get(key)
+				clients[client_idx].Get(key)
 			} else {
-				client.Put(key, value)
+				clients[client_idx].Put(key, value)
 			}
 			opsCompleted++
 		}
@@ -85,6 +100,16 @@ func (h *HostList) String() string {
 func (h *HostList) Set(value string) error {
 	*h = strings.Split(value, ",")
 	return nil
+}
+
+func getServerIdx(key string, N int) int {
+
+	// strKey := strconv.Itoa(key)
+	hashedKey := md5.Sum([]byte(key))
+	hexhash := hex.EncodeToString(hashedKey[:])
+	num := new(big.Int)
+	num.SetString(hexhash, 16)
+	return int(num.Mod(num, big.NewInt(int64(N))).Int64())
 }
 
 func main() {
@@ -113,12 +138,17 @@ func main() {
 	done := atomic.Bool{}
 	resultsCh := make(chan uint64)
 
-	host := hosts[0]
-	clientId := 0
-	go func(clientId int) {
-		workload := kvs.NewWorkload(*workload, *theta)
-		runClient(clientId, host, &done, workload, resultsCh)
-	}(clientId)
+	// host := hosts[0]
+	// clientId := 0
+
+	for idx, host := range hosts {
+		// fmt.Printf("Running on host: %s, clientId: %d\n", host, idx)
+		clientId := idx
+		go func(clientId int) {
+			workload := kvs.NewWorkload(*workload, *theta)
+			runClient(clientId, host, &done, workload, resultsCh, hosts)
+		}(clientId)
+	}
 
 	time.Sleep(time.Duration(*secs) * time.Second)
 	done.Store(true)

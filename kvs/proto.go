@@ -15,3 +15,19 @@ type GetRequest struct {
 type GetResponse struct {
 	Value string
 }
+
+// Batch operations for better performance
+type BatchGetRequest struct {
+	Keys []string
+}
+
+type BatchGetResponse struct {
+	Values map[string]string
+}
+
+type BatchPutRequest struct {
+	Operations []PutRequest
+}
+
+type BatchPutResponse struct {
+}

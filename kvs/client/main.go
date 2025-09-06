@@ -1,14 +1,13 @@
 package main
 
 import (
-	"crypto/md5"
-	"encoding/hex"
 	"flag"
 	"fmt"
+	"hash/fnv"
 	"log"
-	"math/big"
 	"net/rpc"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -28,6 +27,7 @@ func Dial(addr string) *Client {
 	return &Client{rpcClient}
 }
 
+// can use Go to make these async
 func (client *Client) Get(key string) string {
 	request := kvs.GetRequest{
 		Key: key,
@@ -54,35 +54,99 @@ func (client *Client) Put(key string, value string) {
 	}
 }
 
-func runClient(id int, addr string, done *atomic.Bool, workload *kvs.Workload, resultsCh chan<- uint64, servers []string) {
-	N := len(servers)
+// func (client *Client) Get(key string) *rpc.Call {
+// 	request := kvs.GetRequest{
+// 		Key: key,
+// 	}
+// 	response := kvs.GetResponse{}
+// 	client.rpcClient.Call("KVService.Get", &request, &response, nil)
 
-	clients := []*Client{}
+// }
 
-	for _, host := range servers {
-		clients = append(clients, Dial(host))
+// func (client *Client) Put(key string, value string) *rpc.Call {
+// 	request := kvs.PutRequest{
+// 		Key:   key,
+// 		Value: value,
+// 	}
+
+// 	response := kvs.PutResponse{}
+// 	return client.rpcClient.Go("KVService.Put", &request, &response, nil)
+
+// }
+
+func (client *Client) BatchRequest(batchRequest []kvs.Request) *rpc.Call {
+	request := kvs.BatchRequest{
+		Requests: batchRequest,
 	}
-	fmt.Println("Clients", clients)
-	// client := Dial(addr)
+	response := kvs.BatchResponse{}
+	return client.rpcClient.Go("KVService.BatchRequest", &request, &response, nil)
+}
+
+func (client *Client) BatchResponse(batchResponse []kvs.Response) *rpc.Call {
+	request := kvs.BatchResponse{
+		Responses: batchResponse,
+	}
+	response := kvs.BatchResponse{}
+	return client.rpcClient.Go("KVService.BatchResponse", &request, &response, nil)
+}
+
+func runClient(id int, done *atomic.Bool, workload *kvs.Workload, resultsCh chan<- uint64, servers []string, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	clients := make([]*Client, len(servers))
+	for i, host := range servers {
+		clients[i] = Dial(host)
+	}
+	defer func() {
+		// Clean up clients when worker finishes
+		for _, client := range clients {
+			client.rpcClient.Close()
+		}
+	}()
 
 	value := strings.Repeat("x", 128)
 	const batchSize = 1024
-
+	timestamp := uint64(0)
 	opsCompleted := uint64(0)
 
 	for !done.Load() {
+		ServerBatch := make(map[int][]kvs.Request)
+
 		for j := 0; j < batchSize; j++ {
 			op := workload.Next()
 			key := fmt.Sprintf("%d", op.Key)
+			// client := pool.GetClient(key)
 			// fmt.Printf("Sending: key %s\n", key)
-			client_idx := getServerIdx(key, N)
-			// fmt.Printf("client ID: %d\n", client_idx)
-			if op.IsRead {
-				clients[client_idx].Get(key)
-			} else {
-				clients[client_idx].Put(key, value)
+			server_idx := getServerIdx(key, len(clients))
+			timestamp++
+
+			request := kvs.Request{
+				Key:       key,
+				Value:     value,
+				IsRead:    op.IsRead,
+				Timestamp: timestamp,
 			}
-			opsCompleted++
+			ServerBatch[server_idx] = append(ServerBatch[server_idx], request)
+
+		}
+
+		var calls []*rpc.Call
+		for serverIdx, requests := range ServerBatch {
+			if len(requests) > 0 {
+				// for Async Requests
+				call := clients[serverIdx].BatchRequest(requests)
+				calls = append(calls, call)
+			}
+		}
+
+		for _, call := range calls {
+			<-call.Done
+			if call.Error != nil {
+				log.Printf("RPC call failed: %v", call.Error)
+			}
+			if response, ok := call.Reply.(*kvs.BatchResponse); ok {
+				opsCompleted += uint64(len(response.Responses))
+			}
 		}
 	}
 
@@ -103,18 +167,17 @@ func (h *HostList) Set(value string) error {
 }
 
 func getServerIdx(key string, N int) int {
-
 	// strKey := strconv.Itoa(key)
-	hashedKey := md5.Sum([]byte(key))
-	hexhash := hex.EncodeToString(hashedKey[:])
-	num := new(big.Int)
-	num.SetString(hexhash, 16)
-	return int(num.Mod(num, big.NewInt(int64(N))).Int64())
+	hashedKey := fnv.New64a()
+	hashedKey.Write([]byte(key))
+	return int(hashedKey.Sum64() % uint64(N))
 }
 
 func main() {
 	hosts := HostList{}
+	var wg sync.WaitGroup
 
+	workers := flag.Int("workers", 16, "Number of goroutines to spin for each client, default is 5")
 	flag.Var(&hosts, "hosts", "Comma-separated list of host:ports to connect to")
 	theta := flag.Float64("theta", 0.99, "Zipfian distribution skew parameter")
 	workload := flag.String("workload", "YCSB-B", "Workload type (YCSB-A, YCSB-B, YCSB-C)")
@@ -135,28 +198,35 @@ func main() {
 
 	start := time.Now()
 
-	done := atomic.Bool{}
-	resultsCh := make(chan uint64)
-
 	// host := hosts[0]
 	// clientId := 0
+	totalWorkers := len(hosts) * *workers
 
-	for idx, host := range hosts {
-		// fmt.Printf("Running on host: %s, clientId: %d\n", host, idx)
-		clientId := idx
+	done := atomic.Bool{}
+	resultsCh := make(chan uint64, totalWorkers)
+	// fmt.Printf("Running on host: %s, clientId: %d\n", host, idx)
+	for i := 0; i < totalWorkers; i++ {
+		// clientId := idx
+		wg.Add(1)
 		go func(clientId int) {
 			workload := kvs.NewWorkload(*workload, *theta)
-			runClient(clientId, host, &done, workload, resultsCh, hosts)
-		}(clientId)
+			runClient(clientId, &done, workload, resultsCh, hosts, &wg)
+		}(i)
 	}
 
 	time.Sleep(time.Duration(*secs) * time.Second)
 	done.Store(true)
 
-	opsCompleted := <-resultsCh
+	wg.Wait()
+	var totalOps uint64
+	for i := 0; i < totalWorkers; i++ {
+		totalOps += <-resultsCh
+	}
+	// opsCompleted := <-resultsCh
 
 	elapsed := time.Since(start)
 
-	opsPerSec := float64(opsCompleted) / elapsed.Seconds()
+	opsPerSec := float64(totalOps) / elapsed.Seconds()
 	fmt.Printf("throughput %.2f ops/s\n", opsPerSec)
+
 }

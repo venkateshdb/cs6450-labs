@@ -14,6 +14,8 @@ import (
 	"github.com/rstutsman/cs6450-labs/kvs"
 )
 
+var uniqueTimestamp atomic.Uint64
+
 type Client struct {
 	rpcClient *rpc.Client
 }
@@ -106,7 +108,7 @@ func runClient(id int, done *atomic.Bool, workload *kvs.Workload, resultsCh chan
 
 	value := strings.Repeat("x", 128)
 	const batchSize = 1024
-	timestamp := uint64(0)
+	timestamp := uniqueTimestamp.Add(1)
 	opsCompleted := uint64(0)
 
 	for !done.Load() {
@@ -177,7 +179,7 @@ func main() {
 	hosts := HostList{}
 	var wg sync.WaitGroup
 
-	workers := flag.Int("workers", 16, "Number of goroutines to spin for each client, default is 5")
+	workers := flag.Int("workers", 32, "Number of goroutines to spin for each client, default is 16")
 	flag.Var(&hosts, "hosts", "Comma-separated list of host:ports to connect to")
 	theta := flag.Float64("theta", 0.99, "Zipfian distribution skew parameter")
 	workload := flag.String("workload", "YCSB-B", "Workload type (YCSB-A, YCSB-B, YCSB-C)")
@@ -206,9 +208,10 @@ func main() {
 	resultsCh := make(chan uint64, totalWorkers)
 	// fmt.Printf("Running on host: %s, clientId: %d\n", host, idx)
 	for i := 0; i < totalWorkers; i++ {
-		// clientId := idx
+		// clientId := i
 		wg.Add(1)
 		go func(clientId int) {
+			fmt.Printf("Running client %d\n", clientId)
 			workload := kvs.NewWorkload(*workload, *theta)
 			runClient(clientId, &done, workload, resultsCh, hosts, &wg)
 		}(i)

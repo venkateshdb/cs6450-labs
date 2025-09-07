@@ -10,7 +10,7 @@
 ![System resource usage on server when using maximum number of nodes](images/server.png)
 
 *Bandwidth Consumption between Client and server*
-![Bandwidth Consumption between client and server](images/server.png)
+![Bandwidth Consumption between client and server](images/network.png)
 
 ## Design
 

@@ -37,5 +37,5 @@ Contributions:
 
 - Venkatesh: Github Setup and Optimizations
 - Axe: Report & performance analysis
+- Parth: Report & performance analysis.
 - Dibri: Report, performance analysis, and explored additional optimizations.
-- Parth: FILL.

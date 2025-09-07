@@ -28,7 +28,7 @@ func (s *Stats) Sub(prev *Stats) Stats {
 }
 
 type KVService struct {
-	sync.RWMutex
+	sync.Mutex
 	// mp        map[string]string
 	mp        sync.Map
 	stats     Stats
@@ -101,14 +101,14 @@ func (kv *KVService) BatchRequest(request *kvs.BatchRequest, response *kvs.Batch
 }
 
 func (kv *KVService) printStats() {
-	kv.RLock()
+	kv.Lock()
 	stats := kv.stats
 	prevStats := kv.prevStats
 	kv.prevStats = stats
 	now := time.Now()
 	lastPrint := kv.lastPrint
 	kv.lastPrint = now
-	kv.RUnlock()
+	kv.Unlock()
 
 	diff := stats.Sub(&prevStats)
 	deltaS := now.Sub(lastPrint).Seconds()

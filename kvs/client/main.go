@@ -92,7 +92,7 @@ func (client *Client) BatchResponse(batchResponse []kvs.Response) *rpc.Call {
 	return client.rpcClient.Go("KVService.BatchResponse", &request, &response, nil)
 }
 
-func runClient(id int, done *atomic.Bool, workload *kvs.Workload, resultsCh chan<- uint64, servers []string, wg *sync.WaitGroup) {
+func runClient(id int, batch_size *int, done *atomic.Bool, workload *kvs.Workload, resultsCh chan<- uint64, servers []string, wg *sync.WaitGroup) {
 	defer wg.Done()
 
 	clients := make([]*Client, len(servers))
@@ -107,7 +107,7 @@ func runClient(id int, done *atomic.Bool, workload *kvs.Workload, resultsCh chan
 	}()
 
 	value := strings.Repeat("x", 128)
-	const batchSize = 1024
+	batchSize := *batch_size
 	timestamp := uniqueTimestamp.Add(1)
 	opsCompleted := uint64(0)
 
@@ -179,7 +179,8 @@ func main() {
 	hosts := HostList{}
 	var wg sync.WaitGroup
 
-	workers := flag.Int("workers", 32, "Number of goroutines to spin for each client, default is 16")
+	workers := flag.Int("workers", 64, "Number of goroutines to spin for each client, default is 64")
+	batch_size := flag.Int("batch_size", 1024, "Batch size for each client, default is 1024")
 	flag.Var(&hosts, "hosts", "Comma-separated list of host:ports to connect to")
 	theta := flag.Float64("theta", 0.99, "Zipfian distribution skew parameter")
 	workload := flag.String("workload", "YCSB-B", "Workload type (YCSB-A, YCSB-B, YCSB-C)")
@@ -211,9 +212,9 @@ func main() {
 		// clientId := i
 		wg.Add(1)
 		go func(clientId int) {
-			fmt.Printf("Running client %d\n", clientId)
+			// fmt.Printf("Running clien t %d\n", clientId)
 			workload := kvs.NewWorkload(*workload, *theta)
-			runClient(clientId, &done, workload, resultsCh, hosts, &wg)
+			runClient(clientId, batch_size, &done, workload, resultsCh, hosts, &wg)
 		}(i)
 	}
 

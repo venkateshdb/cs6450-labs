@@ -7,7 +7,6 @@ import (
 	"net"
 	"net/http"
 	"net/rpc"
-	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -15,89 +14,200 @@ import (
 	"github.com/rstutsman/cs6450-labs/kvs"
 )
 
+type TxStatus int
+
+const (
+	Pending TxStatus = iota
+	Committed
+	Aborted
+)
+
+type TxInfo struct {
+	Txid     kvs.Txid
+	Status   TxStatus
+	ReadSet  map[string]struct{}
+	WriteSet map[string]string
+}
+
+type KeyLock struct {
+	sync.Mutex
+	readers map[kvs.Txid]struct{}
+	writer  kvs.Txid
+}
+
 type Stats struct {
-	puts uint64
-	gets uint64
+	committedTxns uint64
+	abortedTxns   uint64
+	gets          uint64
+	puts          uint64
 }
 
 func (s *Stats) Sub(prev *Stats) Stats {
 	r := Stats{}
-	r.puts = s.puts - prev.puts
+	r.committedTxns = s.committedTxns - prev.committedTxns
+	r.abortedTxns = s.abortedTxns - prev.abortedTxns
 	r.gets = s.gets - prev.gets
+	r.puts = s.puts - prev.puts
 	return r
 }
 
 type KVService struct {
 	sync.Mutex
-	// mp        map[string]string
-	mp        sync.Map
-	stats     Stats
-	prevStats Stats
-	lastPrint time.Time
+	mp           sync.Map // Stores committed key-value pairs
+	transactions sync.Map // map[kvs.Txid]*TxInfo
+	keyLocks     sync.Map // map[string]*KeyLock
+	stats        Stats
+	prevStats    Stats
+	lastPrint    time.Time
 }
 
 func NewKVService() *KVService {
 	kvs := &KVService{}
 	kvs.mp = sync.Map{}
+	kvs.transactions = sync.Map{}
+	kvs.keyLocks = sync.Map{}
 	kvs.lastPrint = time.Now()
 	return kvs
 }
 
-// func (kv *KVService) Get(request *kvs.GetRequest, response *kvs.GetResponse) error {
-// 	// kv.Lock()
-// 	// defer kv.Unlock()
+func (kv *KVService) getTxInfo(txid kvs.Txid) *TxInfo {
+	if val, ok := kv.transactions.Load(txid); ok {
+		return val.(*TxInfo)
+	}
+	txInfo := &TxInfo{
+		Txid:     txid,
+		Status:   Pending,
+		ReadSet:  make(map[string]struct{}),
+		WriteSet: make(map[string]string),
+	}
+	kv.transactions.Store(txid, txInfo)
+	return txInfo
+}
 
-// 	kv.stats.gets++
+func (kv *KVService) getKeyLock(key string) *KeyLock {
+	if val, ok := kv.keyLocks.Load(key); ok {
+		return val.(*KeyLock)
+	}
+	keyLock := &KeyLock{
+		readers: make(map[kvs.Txid]struct{}),
+		writer:  0,
+	}
+	kv.keyLocks.Store(key, keyLock)
+	return keyLock
+}
 
-// 	if value, found := kv.mp.Load(request.Key); found {
-// 		// fmt.Printf("Get key: %s, value : %s, found: %t\n", request.Key, value.(string), found)
-// 		response.Value = value.(string)
-// 	}
+func (kv *KVService) Get(request *kvs.GetRequest, response *kvs.GetResponse) error {
+	atomic.AddUint64(&kv.stats.gets, 1)
 
-// 	return nil
-// }
+	txInfo := kv.getTxInfo(request.Txid)
+	keyLock := kv.getKeyLock(request.Key)
 
-// func (kv *KVService) Put(request *kvs.PutRequest, response *kvs.PutResponse) error {
-// 	// kv.Lock()
-// 	// defer kv.Unlock()
+	keyLock.Lock()
+	defer keyLock.Unlock()
 
-// 	kv.stats.puts++
-// 	// fmt.Printf("Put key: %s, found: %s\n", request.Key, request.Value)
-// 	kv.mp.Store(request.Key, request.Value)
+	// Check for exclusive lock by another transaction
+	if keyLock.writer != 0 && keyLock.writer != request.Txid {
+		response.LockFailed = true
+		return nil
+	}
 
-// 	return nil
-// }
+	// Grant shared lock
+	keyLock.readers[request.Txid] = struct{}{}
+	txInfo.ReadSet[request.Key] = struct{}{}
 
-func (kv *KVService) BatchRequest(request *kvs.BatchRequest, response *kvs.BatchResponse) error {
-	sort.Slice(request.Requests, func(i, j int) bool {
-		return request.Requests[i].Timestamp < request.Requests[j].Timestamp
-	})
-	results := make([]kvs.Response, len(request.Requests))
+	if value, found := kv.mp.Load(request.Key); found {
+		response.Value = value.(string)
+	} else {
+		response.Value = ""
+	}
 
-	for i, req := range request.Requests {
-		if req.IsRead {
-			// kv.stats.gets++
-			atomic.AddUint64(&kv.stats.gets, 1)
-			if value, found := kv.mp.Load(req.Key); found {
-				results[i] = kvs.Response{
-					Value: value.(string),
-				}
-			} else {
-				results[i] = kvs.Response{Value: ""}
-			}
-		} else {
-			// kv.stats.puts++
-			atomic.AddUint64(&kv.stats.puts, 1)
-			kv.mp.Store(req.Key, req.Value)
-			results[i] = kvs.Response{
-				Value: "",
+	return nil
+}
+
+func (kv *KVService) Put(request *kvs.PutRequest, response *kvs.PutResponse) error {
+	atomic.AddUint64(&kv.stats.puts, 1)
+
+	txInfo := kv.getTxInfo(request.Txid)
+	keyLock := kv.getKeyLock(request.Key)
+
+	keyLock.Lock()
+	defer keyLock.Unlock()
+
+	// Check for any lock by another transaction
+	if keyLock.writer != 0 && keyLock.writer != request.Txid {
+		response.LockFailed = true
+		return nil
+	}
+	if len(keyLock.readers) > 0 {
+		// If there are readers, check if any are from other transactions
+		for readerTxid := range keyLock.readers {
+			if readerTxid != request.Txid {
+				response.LockFailed = true
+				return nil
 			}
 		}
 	}
 
-	response.Responses = results
-	return nil
+	// Grant exclusive lock
+	keyLock.writer = request.Txid
+	txInfo.WriteSet[request.Key] = request.Value
 
+	return nil
+}
+
+func (kv *KVService) Commit(request *kvs.CommitRequest, response *kvs.CommitResponse) error {
+	txInfo := kv.getTxInfo(request.Txid)
+
+	// Apply writes and release locks
+	for key, value := range txInfo.WriteSet {
+		kv.mp.Store(key, value)
+		keyLock := kv.getKeyLock(key)
+		keyLock.Lock()
+		keyLock.writer = 0
+		delete(keyLock.readers, request.Txid)
+		keyLock.Unlock()
+	}
+
+	for key := range txInfo.ReadSet {
+		keyLock := kv.getKeyLock(key)
+		keyLock.Lock()
+		delete(keyLock.readers, request.Txid)
+		keyLock.Unlock()
+	}
+
+	txInfo.Status = Committed
+	if request.Lead {
+		atomic.AddUint64(&kv.stats.committedTxns, 1)
+	}
+	response.Success = true
+	return nil
+}
+
+func (kv *KVService) Abort(request *kvs.AbortRequest, response *kvs.AbortResponse) error {
+	txInfo := kv.getTxInfo(request.Txid)
+
+	// Release all locks
+	for key := range txInfo.WriteSet {
+		keyLock := kv.getKeyLock(key)
+		keyLock.Lock()
+		keyLock.writer = 0
+		delete(keyLock.readers, request.Txid)
+		keyLock.Unlock()
+	}
+
+	for key := range txInfo.ReadSet {
+		keyLock := kv.getKeyLock(key)
+		keyLock.Lock()
+		delete(keyLock.readers, request.Txid)
+		keyLock.Unlock()
+	}
+
+	txInfo.Status = Aborted
+	if request.Lead {
+		atomic.AddUint64(&kv.stats.abortedTxns, 1)
+	}
+	response.Success = true
+	return nil
 }
 
 func (kv *KVService) printStats() {
@@ -113,10 +223,9 @@ func (kv *KVService) printStats() {
 	diff := stats.Sub(&prevStats)
 	deltaS := now.Sub(lastPrint).Seconds()
 
-	fmt.Printf("get/s %0.2f\nput/s %0.2f\nops/s %0.2f\n\n",
-		float64(diff.gets)/deltaS,
-		float64(diff.puts)/deltaS,
-		float64(diff.gets+diff.puts)/deltaS)
+	fmt.Printf("commit/s %0.2f\nabort/s %0.2f\n\n",
+		float64(diff.committedTxns)/deltaS,
+		float64(diff.abortedTxns)/deltaS)
 }
 
 func main() {

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log"
+	"math/rand/v2"
 	"net/rpc"
 	"strings"
 	"sync"
@@ -14,25 +15,101 @@ import (
 	"github.com/rstutsman/cs6450-labs/kvs"
 )
 
-var uniqueTimestamp atomic.Uint64
+var clientIDCounter atomic.Uint64
 
 type Client struct {
-	rpcClient *rpc.Client
+	rpcClient    *rpc.Client
+	clientID     kvs.Txid
+	activeTx     kvs.Txid
+	participants map[string]*rpc.Client // Map of server address to rpc.Client
+	writeSet     map[string]string
+	gen          *kvs.Xorshift64
+	serverAddr   string // The address of this specific server
 }
 
-func Dial(addr string) *Client {
+func Dial(addr string, clientID kvs.Txid) *Client {
 	rpcClient, err := rpc.DialHTTP("tcp", addr)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	return &Client{rpcClient}
+	return &Client{
+		rpcClient:    rpcClient,
+		clientID:     clientID,
+		participants: make(map[string]*rpc.Client),
+		writeSet:     make(map[string]string),
+		gen:          kvs.NewXorshift64(rand.Uint64()),
+		serverAddr:   addr,
+	}
 }
 
-// can use Go to make these async
-func (client *Client) Get(key string) string {
+func (client *Client) Begin() {
+	client.activeTx = kvs.Txid(client.gen.Uint64()) // Generate a new transaction ID
+	client.participants = make(map[string]*rpc.Client)
+	client.writeSet = make(map[string]string)
+}
+
+func (client *Client) Commit() bool {
+	if client.activeTx == 0 {
+		log.Fatal("Commit() called without an active transaction")
+	}
+
+	success := true
+	firstParticipant := true
+	for addr, rpcClient := range client.participants {
+		req := kvs.CommitRequest{
+			Txid: client.activeTx,
+			Lead: firstParticipant,
+		}
+		res := kvs.CommitResponse{}
+		err := rpcClient.Call("KVService.Commit", &req, &res)
+		if err != nil {
+			log.Printf("Commit RPC to %s failed for Txid %d: %v", addr, client.activeTx, err)
+			success = false
+		}
+		firstParticipant = false
+	}
+	client.activeTx = 0 // Clear active transaction
+	return success
+}
+
+func (client *Client) Abort() bool {
+	if client.activeTx == 0 {
+		log.Fatal("Abort() called without an active transaction")
+	}
+
+	success := true
+	firstParticipant := true
+	for addr, rpcClient := range client.participants {
+		req := kvs.AbortRequest{
+			Txid: client.activeTx,
+			Lead: firstParticipant,
+		}
+		res := kvs.AbortResponse{}
+		err := rpcClient.Call("KVService.Abort", &req, &res)
+		if err != nil {
+			log.Printf("Abort RPC to %s failed for Txid %d: %v", addr, client.activeTx, err)
+			success = false
+		}
+		firstParticipant = false
+	}
+	client.activeTx = 0 // Clear active transaction
+	return success
+}
+
+func (client *Client) Get(key string) (string, bool) {
+	if client.activeTx == 0 {
+		log.Fatal("Get() called without an active transaction")
+	}
+
+	// Read-your-own-writes
+	if val, found := client.writeSet[key]; found {
+		return val, false // Not lock failed, as it's a local read
+	}
+
 	request := kvs.GetRequest{
-		Key: key,
+		Txid: client.activeTx,
+		Key:  key,
 	}
 	response := kvs.GetResponse{}
 	err := client.rpcClient.Call("KVService.Get", &request, &response)
@@ -40,11 +117,26 @@ func (client *Client) Get(key string) string {
 		log.Fatal(err)
 	}
 
-	return response.Value
+	if response.LockFailed {
+		client.Abort()
+		return "", true // Indicate implicit abort due to lock failure
+	}
+
+	// Add this server to participants if not already there
+	if _, found := client.participants[client.serverAddr]; !found {
+		client.participants[client.serverAddr] = client.rpcClient
+	}
+
+	return response.Value, false
 }
 
-func (client *Client) Put(key string, value string) {
+func (client *Client) Put(key string, value string) bool {
+	if client.activeTx == 0 {
+		log.Fatal("Put() called without an active transaction")
+	}
+
 	request := kvs.PutRequest{
+		Txid:  client.activeTx,
 		Key:   key,
 		Value: value,
 	}
@@ -54,100 +146,105 @@ func (client *Client) Put(key string, value string) {
 	if err != nil {
 		log.Fatal(err)
 	}
-}
 
-// func (client *Client) Get(key string) *rpc.Call {
-// 	request := kvs.GetRequest{
-// 		Key: key,
-// 	}
-// 	response := kvs.GetResponse{}
-// 	client.rpcClient.Call("KVService.Get", &request, &response, nil)
-
-// }
-
-// func (client *Client) Put(key string, value string) *rpc.Call {
-// 	request := kvs.PutRequest{
-// 		Key:   key,
-// 		Value: value,
-// 	}
-
-// 	response := kvs.PutResponse{}
-// 	return client.rpcClient.Go("KVService.Put", &request, &response, nil)
-
-// }
-
-func (client *Client) BatchRequest(batchRequest []kvs.Request) *rpc.Call {
-	request := kvs.BatchRequest{
-		Requests: batchRequest,
+	if response.LockFailed {
+		client.Abort()
+		return true // Indicate implicit abort due to lock failure
 	}
-	response := kvs.BatchResponse{}
-	return client.rpcClient.Go("KVService.BatchRequest", &request, &response, nil)
-}
 
-func (client *Client) BatchResponse(batchResponse []kvs.Response) *rpc.Call {
-	request := kvs.BatchResponse{
-		Responses: batchResponse,
+	// Add this server to participants if not already there
+	if _, found := client.participants[client.serverAddr]; !found {
+		client.participants[client.serverAddr] = client.rpcClient
 	}
-	response := kvs.BatchResponse{}
-	return client.rpcClient.Go("KVService.BatchResponse", &request, &response, nil)
+
+	client.writeSet[key] = value // Add to write set for read-your-own-writes
+
+	return false
 }
 
-func runClient(id int, batch_size *int, done *atomic.Bool, workload *kvs.Workload, resultsCh chan<- uint64, servers []string, wg *sync.WaitGroup) {
+func runClient(id int, done *atomic.Bool, workload *kvs.Workload, resultsCh chan<- uint64, servers []string, wg *sync.WaitGroup) {
 	defer wg.Done()
 
-	clients := make([]*Client, len(servers))
+	// Each worker gets its own set of clients for each server
+	// This ensures each client has a unique clientID for transaction generation
+	workerClients := make([]*Client, len(servers))
 	for i, host := range servers {
-		clients[i] = Dial(host)
+		workerClients[i] = Dial(host, kvs.Txid(clientIDCounter.Add(1)))
 	}
 	defer func() {
-		// Clean up clients when worker finishes
-		for _, client := range clients {
+		for _, client := range workerClients {
 			client.rpcClient.Close()
 		}
 	}()
 
 	value := strings.Repeat("x", 128)
-	batchSize := *batch_size
-	timestamp := uniqueTimestamp.Add(1)
 	opsCompleted := uint64(0)
+	numOperationsPerTx := 3 // As per requirement
 
 	for !done.Load() {
-		ServerBatch := make(map[int][]kvs.Request)
+		var currentClient *Client
+		var lockFailed bool
+		var txOpsCount int
 
-		for j := 0; j < batchSize; j++ {
-			op := workload.Next()
-			key := fmt.Sprintf("%d", op.Key)
-			// client := pool.GetClient(key)
-			// fmt.Printf("Sending: key %s\n", key)
-			server_idx := getServerIdx(key, len(clients))
-			timestamp++
+		// Transaction retry loop
+		for {
+			// Pick a random server to initiate the transaction
+			serverIdx := rand.IntN(len(workerClients))
+			currentClient = workerClients[serverIdx]
+			currentClient.Begin()
+			lockFailed = false
+			txOpsCount = 0
 
-			request := kvs.Request{
-				Key:       key,
-				Value:     value,
-				IsRead:    op.IsRead,
-				Timestamp: timestamp,
+			for i := 0; i < numOperationsPerTx; i++ {
+				op := workload.Next()
+				key := fmt.Sprintf("%d", op.Key)
+
+				// For sharding, determine the correct client for the key
+				targetServerIdx := getServerIdx(key, len(workerClients))
+				targetClient := workerClients[targetServerIdx]
+
+				// If the operation is for a different server, update currentClient
+				// This is crucial for tracking participants correctly
+				if targetClient != currentClient {
+					// The current client's rpcClient is for the server it initially dialed.
+					// We need to ensure the Get/Put calls are made through the correct rpcClient
+					// for the shard that owns the key.
+					// To simplify, we'll just use the targetClient's rpcClient for the operation.
+					// The participant tracking will ensure all involved servers are contacted for 2PC.
+					currentClient.participants[targetClient.serverAddr] = targetClient.rpcClient
+				}
+
+				if op.IsRead {
+					_, failed := targetClient.Get(key)
+					if failed {
+						lockFailed = true
+						break
+					}
+				} else {
+					failed := targetClient.Put(key, value)
+					if failed {
+						lockFailed = true
+						break
+					}
+				}
+				txOpsCount++
 			}
-			ServerBatch[server_idx] = append(ServerBatch[server_idx], request)
 
-		}
-
-		var calls []*rpc.Call
-		for serverIdx, requests := range ServerBatch {
-			if len(requests) > 0 {
-				// for Async Requests
-				call := clients[serverIdx].BatchRequest(requests)
-				calls = append(calls, call)
+			if lockFailed {
+				// Abort already called by Get/Put if lock failed
+				// Retry the transaction
+				continue
 			}
-		}
 
-		for _, call := range calls {
-			<-call.Done
-			if call.Error != nil {
-				log.Printf("RPC call failed: %v", call.Error)
-			}
-			if response, ok := call.Reply.(*kvs.BatchResponse); ok {
-				opsCompleted += uint64(len(response.Responses))
+			// If all operations succeeded, attempt to commit
+			if currentClient.Commit() {
+				opsCompleted += uint64(txOpsCount) // Count operations only on successful commit
+				break                              // Transaction committed, break retry loop
+			} else {
+				// Commit failed (e.g., network error, though not handled in this assignment)
+				// Abort and retry
+				currentClient.Abort() // Ensure abort is called if commit failed
+				continue
 			}
 		}
 	}
@@ -180,7 +277,6 @@ func main() {
 	var wg sync.WaitGroup
 
 	workers := flag.Int("workers", 64, "Number of goroutines to spin for each client, default is 64")
-	batch_size := flag.Int("batch_size", 1024, "Batch size for each client, default is 1024")
 	flag.Var(&hosts, "hosts", "Comma-separated list of host:ports to connect to")
 	theta := flag.Float64("theta", 0.99, "Zipfian distribution skew parameter")
 	workload := flag.String("workload", "YCSB-B", "Workload type (YCSB-A, YCSB-B, YCSB-C)")
@@ -214,7 +310,7 @@ func main() {
 		go func(clientId int) {
 			// fmt.Printf("Running clien t %d\n", clientId)
 			workload := kvs.NewWorkload(*workload, *theta)
-			runClient(clientId, batch_size, &done, workload, resultsCh, hosts, &wg)
+			runClient(clientId, &done, workload, resultsCh, hosts, &wg)
 		}(i)
 	}
 

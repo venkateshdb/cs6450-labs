@@ -17,12 +17,13 @@ import (
 type TxStatus int
 
 const (
-	Pending TxStatus = iota
+	Pending TxStatus = 0
 	Committed
 	Aborted
 )
 
 type TxInfo struct {
+	sync.Mutex
 	Txid     kvs.Txid
 	Status   TxStatus
 	ReadSet  map[string]struct{}
@@ -71,37 +72,34 @@ func NewKVService() *KVService {
 }
 
 func (kv *KVService) getTxInfo(txid kvs.Txid) *TxInfo {
-	if val, ok := kv.transactions.Load(txid); ok {
-		return val.(*TxInfo)
-	}
 	txInfo := &TxInfo{
 		Txid:     txid,
 		Status:   Pending,
 		ReadSet:  make(map[string]struct{}),
 		WriteSet: make(map[string]string),
 	}
-	kv.transactions.Store(txid, txInfo)
-	return txInfo
+	val, _ := kv.transactions.LoadOrStore(txid, txInfo)
+	return val.(*TxInfo)
 }
 
 func (kv *KVService) getKeyLock(key string) *KeyLock {
-	if val, ok := kv.keyLocks.Load(key); ok {
-		return val.(*KeyLock)
-	}
 	keyLock := &KeyLock{
 		readers: make(map[kvs.Txid]struct{}),
 		writer:  0,
 	}
-	kv.keyLocks.Store(key, keyLock)
-	return keyLock
+	val, _ := kv.keyLocks.LoadOrStore(key, keyLock)
+	return val.(*KeyLock)
 }
 
 func (kv *KVService) Get(request *kvs.GetRequest, response *kvs.GetResponse) error {
 	atomic.AddUint64(&kv.stats.gets, 1)
 
+	// Anti simu-access locks
 	txInfo := kv.getTxInfo(request.Txid)
 	keyLock := kv.getKeyLock(request.Key)
 
+	txInfo.Lock()
+	defer txInfo.Unlock()
 	keyLock.Lock()
 	defer keyLock.Unlock()
 
@@ -127,25 +125,20 @@ func (kv *KVService) Get(request *kvs.GetRequest, response *kvs.GetResponse) err
 func (kv *KVService) Put(request *kvs.PutRequest, response *kvs.PutResponse) error {
 	atomic.AddUint64(&kv.stats.puts, 1)
 
+	// Anti simu-access locks
 	txInfo := kv.getTxInfo(request.Txid)
 	keyLock := kv.getKeyLock(request.Key)
 
+	txInfo.Lock()
+	defer txInfo.Unlock()
 	keyLock.Lock()
 	defer keyLock.Unlock()
 
-	// Check for any lock by another transaction
-	if keyLock.writer != 0 && keyLock.writer != request.Txid {
+	// check for write-write and write-read conflicts.
+	if (keyLock.writer != 0 && keyLock.writer != request.Txid) ||
+		(len(keyLock.readers) > 0 && !isOnlyReader(keyLock.readers, request.Txid)) {
 		response.LockFailed = true
 		return nil
-	}
-	if len(keyLock.readers) > 0 {
-		// If there are readers, check if any are from other transactions
-		for readerTxid := range keyLock.readers {
-			if readerTxid != request.Txid {
-				response.LockFailed = true
-				return nil
-			}
-		}
 	}
 
 	// Grant exclusive lock
@@ -155,22 +148,48 @@ func (kv *KVService) Put(request *kvs.PutRequest, response *kvs.PutResponse) err
 	return nil
 }
 
-func (kv *KVService) Commit(request *kvs.CommitRequest, response *kvs.CommitResponse) error {
-	txInfo := kv.getTxInfo(request.Txid)
+func isOnlyReader(readers map[kvs.Txid]struct{}, txid kvs.Txid) bool {
+	if len(readers) == 1 {
+		if _, ok := readers[txid]; ok {
+			return true
+		}
+	}
+	return false
+}
 
-	// Apply writes and release locks
-	for key, value := range txInfo.WriteSet {
-		kv.mp.Store(key, value)
-		keyLock := kv.getKeyLock(key)
-		keyLock.Lock()
-		keyLock.writer = 0
-		delete(keyLock.readers, request.Txid)
-		keyLock.Unlock()
+func (kv *KVService) Commit(request *kvs.CommitRequest, response *kvs.CommitResponse) error {
+	// Anti simu-access locks
+	txInfo := kv.getTxInfo(request.Txid)
+	txInfo.Lock()
+	defer txInfo.Unlock()
+
+	if txInfo.Status != Pending {
+		response.Success = (txInfo.Status == Committed)
+		return nil
 	}
 
+	// Writes
+	for key, value := range txInfo.WriteSet {
+		kv.mp.Store(key, value)
+	}
+
+	// Release all locks
+	allKeys := make(map[string]struct{})
+	for key := range txInfo.WriteSet {
+		allKeys[key] = struct{}{}
+	}
 	for key := range txInfo.ReadSet {
+		allKeys[key] = struct{}{}
+	}
+
+	for key := range allKeys {
 		keyLock := kv.getKeyLock(key)
 		keyLock.Lock()
+		if _, isWrite := txInfo.WriteSet[key]; isWrite {
+			if keyLock.writer == request.Txid {
+				keyLock.writer = 0
+			}
+		}
 		delete(keyLock.readers, request.Txid)
 		keyLock.Unlock()
 	}
@@ -184,20 +203,33 @@ func (kv *KVService) Commit(request *kvs.CommitRequest, response *kvs.CommitResp
 }
 
 func (kv *KVService) Abort(request *kvs.AbortRequest, response *kvs.AbortResponse) error {
+	// Anti simu-access locks
 	txInfo := kv.getTxInfo(request.Txid)
+	txInfo.Lock()
+	defer txInfo.Unlock()
 
-	// Release all locks
-	for key := range txInfo.WriteSet {
-		keyLock := kv.getKeyLock(key)
-		keyLock.Lock()
-		keyLock.writer = 0
-		delete(keyLock.readers, request.Txid)
-		keyLock.Unlock()
+	if txInfo.Status != Pending {
+		response.Success = true // Idempotent abort
+		return nil
 	}
 
+	// Release all locks held by the transaction
+	allKeys := make(map[string]struct{})
+	for key := range txInfo.WriteSet {
+		allKeys[key] = struct{}{}
+	}
 	for key := range txInfo.ReadSet {
+		allKeys[key] = struct{}{}
+	}
+
+	for key := range allKeys {
 		keyLock := kv.getKeyLock(key)
 		keyLock.Lock()
+		if _, isWrite := txInfo.WriteSet[key]; isWrite {
+			if keyLock.writer == request.Txid {
+				keyLock.writer = 0
+			}
+		}
 		delete(keyLock.readers, request.Txid)
 		keyLock.Unlock()
 	}

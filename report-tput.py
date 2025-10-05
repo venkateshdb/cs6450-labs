@@ -23,7 +23,7 @@ for log_path in log_files:
     throughputs = []
     with open(log_path) as f:
         for line in f:
-            if "ops/s" in line:
+            if "commit/s" in line:
                 parts = line.strip().split()
                 try:
                     # Throughput value is the 2nd column in original awk ($2)

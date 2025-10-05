@@ -7,6 +7,7 @@ import (
 	"log"
 	"math/rand/v2"
 	"net/rpc"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -16,6 +17,8 @@ import (
 )
 
 var clientIDCounter atomic.Uint64
+var initDone atomic.Bool
+var once sync.Once
 
 type Client struct {
 	rpcClient    *rpc.Client
@@ -97,7 +100,7 @@ func (client *Client) Abort() bool {
 	return success
 }
 
-func (client *Client) Get(key string) (string, bool) {
+func (client *Client) Get(target *Client, key string) (string, bool) {
 	if client.activeTx == 0 {
 		log.Fatal("Get() called without an active transaction")
 	}
@@ -112,25 +115,25 @@ func (client *Client) Get(key string) (string, bool) {
 		Key:  key,
 	}
 	response := kvs.GetResponse{}
-	err := client.rpcClient.Call("KVService.Get", &request, &response)
+	err := target.rpcClient.Call("KVService.Get", &request, &response)
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	if response.LockFailed {
 		client.Abort()
-		return "", true // Indicate implicit abort due to lock failure
+		return "", true
 	}
 
 	// Add this server to participants if not already there
-	if _, found := client.participants[client.serverAddr]; !found {
-		client.participants[client.serverAddr] = client.rpcClient
+	if _, found := client.participants[target.serverAddr]; !found {
+		client.participants[target.serverAddr] = target.rpcClient
 	}
 
 	return response.Value, false
 }
 
-func (client *Client) Put(key string, value string) bool {
+func (client *Client) Put(target *Client, key string, value string) bool {
 	if client.activeTx == 0 {
 		log.Fatal("Put() called without an active transaction")
 	}
@@ -142,7 +145,7 @@ func (client *Client) Put(key string, value string) bool {
 	}
 
 	response := kvs.PutResponse{}
-	err := client.rpcClient.Call("KVService.Put", &request, &response)
+	err := target.rpcClient.Call("KVService.Put", &request, &response)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -153,11 +156,12 @@ func (client *Client) Put(key string, value string) bool {
 	}
 
 	// Add this server to participants if not already there
-	if _, found := client.participants[client.serverAddr]; !found {
-		client.participants[client.serverAddr] = client.rpcClient
+	if _, found := client.participants[target.serverAddr]; !found {
+		client.participants[target.serverAddr] = target.rpcClient
 	}
 
-	client.writeSet[key] = value // Add to write set for read-your-own-writes
+	// Add to write set for read-your-own-writes
+	client.writeSet[key] = value
 
 	return false
 }
@@ -165,32 +169,29 @@ func (client *Client) Put(key string, value string) bool {
 func runClient(id int, done *atomic.Bool, workload *kvs.Workload, resultsCh chan<- uint64, servers []string, wg *sync.WaitGroup) {
 	defer wg.Done()
 
-	// Each worker gets its own set of clients for each server
-	// This ensures each client has a unique clientID for transaction generation
-	workerClients := make([]*Client, len(servers))
+	rpc_clients := make([]*Client, len(servers))
 	for i, host := range servers {
-		workerClients[i] = Dial(host, kvs.Txid(clientIDCounter.Add(1)))
+		rpc_clients[i] = Dial(host, kvs.Txid(clientIDCounter.Add(1)))
 	}
 	defer func() {
-		for _, client := range workerClients {
+		for _, client := range rpc_clients {
 			client.rpcClient.Close()
 		}
 	}()
 
 	value := strings.Repeat("x", 128)
 	opsCompleted := uint64(0)
-	numOperationsPerTx := 3 // As per requirement
+	numOperationsPerTx := 3 // Could go crazy??? 20???
 
 	for !done.Load() {
 		var currentClient *Client
 		var lockFailed bool
 		var txOpsCount int
 
-		// Transaction retry loop
+		// Retry loop
 		for {
-			// Pick a random server to initiate the transaction
-			serverIdx := rand.IntN(len(workerClients))
-			currentClient = workerClients[serverIdx]
+			serverIdx := rand.IntN(len(rpc_clients))
+			currentClient = rpc_clients[serverIdx]
 			currentClient.Begin()
 			lockFailed = false
 			txOpsCount = 0
@@ -199,51 +200,32 @@ func runClient(id int, done *atomic.Bool, workload *kvs.Workload, resultsCh chan
 				op := workload.Next()
 				key := fmt.Sprintf("%d", op.Key)
 
-				// For sharding, determine the correct client for the key
-				targetServerIdx := getServerIdx(key, len(workerClients))
-				targetClient := workerClients[targetServerIdx]
-
-				// If the operation is for a different server, update currentClient
-				// This is crucial for tracking participants correctly
-				if targetClient != currentClient {
-					// The current client's rpcClient is for the server it initially dialed.
-					// We need to ensure the Get/Put calls are made through the correct rpcClient
-					// for the shard that owns the key.
-					// To simplify, we'll just use the targetClient's rpcClient for the operation.
-					// The participant tracking will ensure all involved servers are contacted for 2PC.
-					currentClient.participants[targetClient.serverAddr] = targetClient.rpcClient
-				}
+				// Determine the correct client for the key
+				targetServerIdx := getServerIdx(key, len(rpc_clients))
+				targetServer := rpc_clients[targetServerIdx]
 
 				if op.IsRead {
-					_, failed := targetClient.Get(key)
-					if failed {
-						lockFailed = true
-						break
-					}
-				} else {
-					failed := targetClient.Put(key, value)
-					if failed {
-						lockFailed = true
-						break
-					}
+					_, lockFailed = currentClient.Get(targetServer, key)
+				} else { // Write operation
+					lockFailed = currentClient.Put(targetServer, key, value)
+				}
+
+				if lockFailed {
+					break
 				}
 				txOpsCount++
 			}
 
 			if lockFailed {
-				// Abort already called by Get/Put if lock failed
-				// Retry the transaction
 				continue
 			}
 
-			// If all operations succeeded, attempt to commit
+			// Abort/retry
 			if currentClient.Commit() {
-				opsCompleted += uint64(txOpsCount) // Count operations only on successful commit
-				break                              // Transaction committed, break retry loop
+				opsCompleted += uint64(txOpsCount)
+				break
 			} else {
-				// Commit failed (e.g., network error, though not handled in this assignment)
-				// Abort and retry
-				currentClient.Abort() // Ensure abort is called if commit failed
+				currentClient.Abort()
 				continue
 			}
 		}
@@ -251,6 +233,161 @@ func runClient(id int, done *atomic.Bool, workload *kvs.Workload, resultsCh chan
 
 	fmt.Printf("Client %d finished operations.\n", id)
 
+	resultsCh <- opsCompleted
+}
+
+func runXferClient(id int, done *atomic.Bool, resultsCh chan<- uint64, servers []string, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	rpc_clients := make([]*Client, len(servers))
+	for i, host := range servers {
+		rpc_clients[i] = Dial(host, kvs.Txid(clientIDCounter.Add(1)))
+	}
+	defer func() {
+		for _, client := range rpc_clients {
+			client.rpcClient.Close()
+		}
+	}()
+
+	// Initialization of accounts by client 0
+	once.Do(func() {
+		client := rpc_clients[0] // Use the first client for initialization
+		for {
+			fmt.Println("Before begin()")
+			client.Begin()
+			for i := 0; i < 10; i++ {
+				key := strconv.Itoa(i)
+				targetServerIdx := getServerIdx(key, len(rpc_clients))
+				// fmt.Println("targetServerIdx: ", targetServerIdx)
+				// fmt.Println("i:", i)
+				// If put or get return true, it means failed to aquire lock
+				client.Put(rpc_clients[targetServerIdx], key, "1000")
+			}
+			if client.Commit() {
+				break // Initialization successful
+			}
+		}
+		// check for initialization
+		balances := make([]int, 10)
+		client.Begin()
+		for i := 0; i < 10; i++ {
+			key := strconv.Itoa(i)
+			targetServerIdx := getServerIdx(key, len(rpc_clients))
+			valStr, lockFailed := client.Get(rpc_clients[targetServerIdx], key)
+			if lockFailed {
+				break
+			}
+			bal, _ := strconv.Atoi(valStr)
+			balances[i] = bal
+		}
+		if client.Commit() {
+			fmt.Printf("After initialization, balances: %v\n", balances)
+		}
+		initDone.Store(true)
+	})
+
+	// Wait for initialization to complete
+	for !initDone.Load() {
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	opsCompleted := uint64(0)
+	clientId := rand.IntN(10) // Randomize id
+
+	for !done.Load() {
+		// Transfer transaction
+		for {
+			serverIdx := rand.IntN(len(rpc_clients))
+			client := rpc_clients[serverIdx]
+			client.Begin()
+
+			src := clientId
+			// always the next client
+			dst := (clientId + 1) % 10
+			// dst := rand.IntN(10)
+
+			// Skip self transfer if necessary
+			if src == dst {
+				continue
+			}
+
+			srcKey := strconv.Itoa(src)
+			dstKey := strconv.Itoa(dst)
+
+			srcTarget := rpc_clients[getServerIdx(srcKey, len(rpc_clients))]
+			dstTarget := rpc_clients[getServerIdx(dstKey, len(rpc_clients))]
+
+			srcValStr, lockFailed := client.Get(srcTarget, srcKey)
+			if lockFailed {
+				continue
+			}
+			srcBal, _ := strconv.Atoi(srcValStr)
+
+			if srcBal < 100 {
+				client.Abort()
+				break
+			}
+
+			dstValStr, lockFailed := client.Get(dstTarget, dstKey)
+			if lockFailed {
+				continue
+			}
+			dstBal, _ := strconv.Atoi(dstValStr)
+
+			if client.Put(srcTarget, srcKey, strconv.Itoa(srcBal-100)) {
+				continue
+			}
+			if client.Put(dstTarget, dstKey, strconv.Itoa(dstBal+100)) {
+				continue
+			}
+
+			if client.Commit() {
+				opsCompleted++
+				break // Success
+			}
+		}
+
+		// Minimal check interval is 6
+		periodicity := uint64(rand.IntN(20) + 5)
+
+		if opsCompleted > 0 && opsCompleted%periodicity == 0 {
+			for {
+				serverIdx := rand.IntN(len(rpc_clients))
+				client := rpc_clients[serverIdx]
+				client.Begin()
+
+				total := 0
+				balances := make([]int, 10)
+				aborted := false
+
+				// GET ALL ACCOUNTS
+				for i := 0; i < 10; i++ {
+					key := strconv.Itoa(i)
+					target := rpc_clients[getServerIdx(key, len(rpc_clients))]
+					valStr, lockFailed := client.Get(target, key)
+					if lockFailed {
+						aborted = true
+						break
+					}
+					bal, _ := strconv.Atoi(valStr)
+					balances[i] = bal
+					total += bal
+				}
+
+				if aborted {
+					continue
+				}
+
+				if client.Commit() {
+					if total != 10000 {
+						log.Fatalf("Assertion failed: total balance is %d, expected 10000. Balances: %v", total, balances)
+					}
+					fmt.Printf("Client %d verified total balance: %d. Balances: %v\n", id, total, balances)
+					break // Success
+				}
+			}
+		}
+	}
 	resultsCh <- opsCompleted
 }
 
@@ -279,7 +416,7 @@ func main() {
 	workers := flag.Int("workers", 64, "Number of goroutines to spin for each client, default is 64")
 	flag.Var(&hosts, "hosts", "Comma-separated list of host:ports to connect to")
 	theta := flag.Float64("theta", 0.99, "Zipfian distribution skew parameter")
-	workload := flag.String("workload", "YCSB-B", "Workload type (YCSB-A, YCSB-B, YCSB-C)")
+	workload := flag.String("workload", "YCSB-B", "Workload type (YCSB-A, YCSB-B, YCSB-C, xfer)")
 	secs := flag.Int("secs", 30, "Duration in seconds for each client to run")
 	flag.Parse()
 
@@ -308,9 +445,13 @@ func main() {
 		// clientId := i
 		wg.Add(1)
 		go func(clientId int) {
-			// fmt.Printf("Running clien t %d\n", clientId)
-			workload := kvs.NewWorkload(*workload, *theta)
-			runClient(clientId, &done, workload, resultsCh, hosts, &wg)
+			if *workload == "xfer" {
+				runXferClient(clientId, &done, resultsCh, hosts, &wg)
+			} else {
+				// fmt.Printf("Running clien t %d\n", clientId)
+				workload := kvs.NewWorkload(*workload, *theta)
+				runClient(clientId, &done, workload, resultsCh, hosts, &wg)
+			}
 		}(i)
 	}
 
@@ -327,6 +468,8 @@ func main() {
 	elapsed := time.Since(start)
 
 	opsPerSec := float64(totalOps) / elapsed.Seconds()
-	fmt.Printf("throughput %.2f ops/s\n", opsPerSec)
+	if *workload != "xfer" {
+		fmt.Printf("throughput %.2f ops/s\n", opsPerSec)
+	}
 
 }

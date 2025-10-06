@@ -27,7 +27,7 @@ type GetResponse struct {
 
 type CommitRequest struct {
 	Txid Txid
-	Lead bool // True if this is the leading participant for stats counting
+	Lead bool //  if leading participant for stats counting
 }
 
 type CommitResponse struct {
@@ -36,7 +36,7 @@ type CommitResponse struct {
 
 type AbortRequest struct {
 	Txid Txid
-	Lead bool // True if this is the leading participant for stats counting
+	Lead bool 
 }
 
 type AbortResponse struct {
